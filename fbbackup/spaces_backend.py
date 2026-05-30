@@ -480,6 +480,49 @@ class SpacesBackend:
         self._cutoff_ms_cache = mx * 1000  # seconds → ms (the scanner uses ms)
         return self._cutoff_ms_cache
 
+    def _embed_status(self) -> dict:
+        """Whether semantic search is stale — i.e. posts were imported since the
+        last embed run. (A row-count diff is wrong: embed.py intentionally skips
+        trivial posts, so embedded < total even when fully up to date.) We compare
+        an import freshness marker against the embeddings' mtime instead."""
+        st = getattr(self, "_reembed_state", {"running": False, "done": False, "error": None})
+        meta_p = self._index_dir / "embed-meta.json"
+        marker = self._index_dir / ".last-import"
+        embedded = 0
+        try:
+            embedded = int(json.loads(meta_p.read_text(encoding="utf-8")).get("count", 0))
+        except Exception:
+            pass
+        pending = False
+        try:
+            if marker.is_file() and (not meta_p.is_file()
+                                     or marker.stat().st_mtime > meta_p.stat().st_mtime):
+                pending = True
+        except Exception:
+            pass
+        return {"running": bool(st.get("running")), "done": bool(st.get("done")),
+                "error": st.get("error"), "embedded": embedded,
+                "has_embeddings": meta_p.is_file(), "pending": pending}
+
+    def _start_reembed(self) -> dict:
+        """Re-run embeddings over all rows (incl. live imports) in the background."""
+        st = getattr(self, "_reembed_state", None)
+        if st and st.get("running"):
+            return {"ok": True, "running": True}
+        self._reembed_state = {"running": True, "done": False, "error": None}
+
+        def _run() -> None:
+            try:
+                from .embed import embed
+                embed(self.root, self._index_dir)
+                self._emb_loaded = False          # force reload of the new vectors
+                self._load_embeddings()
+                self._reembed_state = {"running": False, "done": True, "error": None}
+            except Exception as e:  # noqa: BLE001
+                self._reembed_state = {"running": False, "done": False, "error": str(e)}
+        threading.Thread(target=_run, name="fb-reembed", daemon=True).start()
+        return {"ok": True, "running": True}
+
     def _thumb(self, abs_path: Path, w: int) -> Path | None:
         import hashlib
         if abs_path.suffix.lower() == ".gif":
@@ -860,6 +903,15 @@ class SpacesBackend:
             so a first scan only imports the gap between the export and now."""
             return {"max_ts": b._export_max_ts()}
 
+        @r.get("/embed-status")
+        def embed_status():
+            return b._embed_status()
+
+        @r.post("/reembed")
+        def reembed(request: Request):
+            b._require_write(request)
+            return b._start_reembed()
+
         def _import_one(payload: dict) -> dict:
             """One scraped post → a markdown row in spaces-data (same format as
             the export), so live posts appear alongside the export in the FB
@@ -894,6 +946,10 @@ class SpacesBackend:
             items = batch if batch is not None else [body]
             results = [_import_one(p) for p in items]
             b._index = None  # rebuilt lazily on the next browse — keeps it fresh
+            try:  # mark semantic search stale until a re-embed
+                (b._index_dir / ".last-import").touch()
+            except Exception:
+                pass
             if batch is not None:
                 return {"ok": True, "count": len(results), "results": results}
             return results[0]
