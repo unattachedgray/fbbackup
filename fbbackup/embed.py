@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -141,14 +142,20 @@ def embed_query(text: str, provider: str | None = None, key: str | None = None) 
 
 
 def _content(text: str) -> str:
-    """Clean substantive text: drop frontmatter, the H1 title, image/link markup.
-    "" for trivial posts (no text, or text equal to the title) so they don't
-    pollute results (they're greyed out in the UI anyway)."""
-    body = text
+    """Clean substantive text for embedding: drop frontmatter, the H1 title, and
+    image/link markup. Returns "" only for posts with NO real text, or for pure
+    RESHARES whose text is just the boilerplate label (content == title and
+    type == share) — those would pollute search. A single-line status/photo/link
+    post has content == title too (the writer duplicates the text as title+body),
+    but that text is REAL, so it IS embedded. (Earlier this dropped ~3k genuine
+    short posts — see the type breakdown in the FB-distribution notes.)"""
+    typ, body = "", text
     if body.startswith("---"):
         rest = body[3:].lstrip("\n")
         end = rest.find("\n---")
         if end != -1:
+            m = re.search(r"^type:\s*(\S+)", rest[:end], re.M)
+            typ = m.group(1) if m else ""
             body = rest[end + 4:].lstrip("\n")
     title, lines = "", []
     for line in body.splitlines():
@@ -162,7 +169,11 @@ def _content(text: str) -> str:
             continue
         lines.append(s)
     content = " ".join(" ".join(lines).split())
-    return "" if (not content or content == title) else content[:1500]
+    if not content:
+        return ""
+    if content == title and typ == "share":  # reshare boilerplate only
+        return ""
+    return content[:1500]
 
 
 def embed(spaces_root: Path, out_dir: Path, workspace: str = "default") -> dict:
