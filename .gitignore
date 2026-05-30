@@ -1,0 +1,21 @@
+# Regenerable derived data — rebuild from the (external, read-only) FB export
+# via `fbbackup parse` + `materialize` + `embed`. The source lives on /mnt/d,
+# never in the repo; embeddings.npy alone is ~100 MB of binary.
+/index/
+/spaces-data/
+
+# Caches
+.thumb-cache/
+.unfurl-cache/
+.playwright-mcp/
+
+# Dev screenshots (captured during the build; not source)
+/*.jpeg
+/*.jpg
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/

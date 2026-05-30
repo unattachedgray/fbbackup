@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Facebook archive</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">📘 Facebook archive</div>
+    <div class="filters">
+      <input id="q" type="search" placeholder="Search posts…" autocomplete="off">
+      <select id="type"><option value="">All types</option></select>
+      <select id="year"><option value="">All years</option></select>
+      <label class="chk"><input id="hasMedia" type="checkbox"> Has media</label>
+    </div>
+    <div id="count" class="count"></div>
+  </header>
+
+  <main id="feed" class="feed"></main>
+  <div id="sentinel" class="sentinel"></div>
+  <div id="status" class="status"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

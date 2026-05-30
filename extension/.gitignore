@@ -1,0 +1,11 @@
+# build artifacts / signing
+*.xpi
+*.zip
+web-ext-artifacts/
+
+# editor / OS cruft
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/

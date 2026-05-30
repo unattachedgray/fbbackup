@@ -1,0 +1,20 @@
+[project]
+name = "fbbackup"
+version = "0.1.0"
+description = "Browse, back up, and host your Facebook post export — faithfully or as an agent-native Notion-like workspace."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+fbbackup = "fbbackup.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["fbbackup"]

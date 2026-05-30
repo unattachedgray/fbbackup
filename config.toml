@@ -1,0 +1,26 @@
+# fbbackup configuration.
+#
+# Paths use forward slashes on every OS (TOML treats "\" as an escape).
+# Windows users: write your export path like 'D:/dev/facebook-data'
+# (or use a literal string with single quotes: 'D:\dev\facebook-data').
+
+[export]
+# Root of the unzipped Facebook download. May contain one or more
+# "facebook-*" export folders (media is searched across all of them).
+# The source is treated as READ-ONLY — fbbackup never writes here.
+root = "/mnt/d/dev/facebook-data"
+
+[output]
+# Where the canonical index + media manifest are written (NOT the export).
+dir = "index"
+
+[weft]
+# v1 rides the user's running Weft dashboard. Phase 2 ships a standalone server.
+base_url = "http://localhost:9119"
+workspace = "facebook"
+# Auth token for the import endpoint (read from ~/.hermes/weftbase-token if blank).
+token = ""
+
+[serve]
+host = "127.0.0.1"
+port = 8730
