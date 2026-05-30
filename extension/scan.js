@@ -1,21 +1,29 @@
-// fbbackup scanner — scan mode.
+// fbbackup scanner — scan mode (Chrome + Firefox).
 //
 // Toggle the floating button, then scroll your Facebook profile / activity log.
-// Every post that scrolls into view is scraped and POSTed (via the background
-// script) to your local fbbackup import endpoint, where it becomes a markdown
-// row alongside the export data. No scheduling, no queue — just scroll.
+// Posts that scroll into view are scraped, batched, and POSTed (via the
+// background script) to your local fbbackup archive, where they become markdown
+// rows alongside the export. It stops on its own when it scrolls into posts you
+// already have — either ones already imported (a re-scan) or ones older than
+// your export (a first scan) — so each run only grabs what's new. Stop anytime.
 //
-// FB's feed DOM is messy and changes often, so this is best-effort: it captures
-// permalink, text (with emoji), images, timestamp, and reshare attribution.
-// Reshared videos/posts display in the FB Browser via the original-URL embed,
-// so the extension does not need to download videos.
+// FB's feed DOM is messy and changes often, so scraping is best-effort: it
+// captures permalink, text (with emoji), images, timestamp, and reshare
+// attribution. Reshared videos/posts display via the original-URL embed, so the
+// extension doesn't download videos.
 (function () {
   if (window.__fbbackupScan) return;
   window.__fbbackupScan = true;
 
+  const ext = (typeof browser !== "undefined") ? browser : chrome;
+
+  const BATCH = 8;        // posts per import request
+  const STOP_AFTER = 12;  // consecutive "already have it" posts → reached the boundary
+
   let scanning = false;
   const seen = new Set();
   let scanned = 0, imported = 0, failed = 0;
+  let buf = [], existedRun = 0, oldRun = 0, cutoffMs = 0, doneReason = "";
 
   // ── floating UI ──────────────────────────────────────────────────────────
   const btn = document.createElement("div");
@@ -23,32 +31,28 @@
     "position:fixed;bottom:16px;right:16px;z-index:2147483647;background:#1877f2;color:#fff;" +
     "font:600 13px system-ui,sans-serif;padding:9px 14px;border-radius:22px;cursor:pointer;" +
     "box-shadow:0 2px 10px rgba(0,0,0,.35);user-select:none";
-  btn.textContent = "▶ Scan to fbbackup";
   const status = document.createElement("div");
   status.style.cssText =
-    "position:fixed;bottom:58px;right:16px;z-index:2147483647;background:rgba(0,0,0,.8);color:#fff;" +
-    "font:11px ui-monospace,monospace;padding:5px 9px;border-radius:7px;max-width:240px;display:none";
+    "position:fixed;bottom:58px;right:16px;z-index:2147483647;background:rgba(0,0,0,.82);color:#fff;" +
+    "font:11px ui-monospace,monospace;padding:5px 9px;border-radius:7px;max-width:260px;display:none";
   function paint() {
     btn.textContent = scanning ? "⏸ Scanning… (click to stop)" : "▶ Scan to fbbackup";
     btn.style.background = scanning ? "#e4405f" : "#1877f2";
     status.style.display = scanning || scanned ? "block" : "none";
-    status.textContent = `scanned ${scanned} · imported ${imported}` + (failed ? ` · ${failed} failed` : "");
+    let s = `scanned ${scanned} · new ${imported}` + (failed ? ` · ${failed} failed` : "");
+    if (!scanning && doneReason) s += `\n✓ ${doneReason}`;
+    status.textContent = s;
   }
   function mount() {
-    if (!document.body.contains(btn)) document.documentElement.appendChild(btn);
-    if (!document.body.contains(status)) document.documentElement.appendChild(status);
+    if (!document.documentElement.contains(btn)) document.documentElement.appendChild(btn);
+    if (!document.documentElement.contains(status)) document.documentElement.appendChild(status);
   }
   mount();
   setInterval(mount, 3000); // FB SPA nav can wipe the DOM; re-attach
 
-  btn.onclick = () => {
-    scanning = !scanning;
-    paint();
-    if (scanning) sweep();
-  };
+  btn.onclick = () => { if (scanning) stop("stopped"); else start(); };
 
   // ── extraction helpers ───────────────────────────────────────────────────
-  // innerText drops emoji (rendered as <img alt>); walk nodes to keep them.
   function richText(el) {
     if (!el) return "";
     let out = "";
@@ -60,7 +64,6 @@
     });
     return out;
   }
-
   function findPermalink(scope) {
     for (const a of scope.querySelectorAll("a[href]")) {
       const h = a.getAttribute("href") || "";
@@ -71,19 +74,17 @@
     }
     return "";
   }
-
   function fbIdOf(url) {
     const m = url.match(/(pfbid[A-Za-z0-9]+)/) || url.match(/story_fbid=(\d{6,})/) || url.match(/\/(\d{8,})/);
     return m ? m[1] : "";
   }
-
+  // {ms, exact}: `exact` only when FB embedded the real creation time (we trust
+  // it for the timestamp cutoff; the Date.now() fallback is not trusted).
   function postTime(article) {
-    // Best-effort: FB sometimes embeds the unix creation time in the markup.
     const m = article.innerHTML.match(/"(?:creation_time|publish_time)":(\d{9,11})/);
-    if (m) return Number(m[1]) * 1000;
-    return Date.now(); // fallback — recent posts land in the current period
+    if (m) return { ms: Number(m[1]) * 1000, exact: true };
+    return { ms: Date.now(), exact: false };
   }
-
   function images(scope) {
     const out = [];
     scope.querySelectorAll("img").forEach((im) => {
@@ -95,7 +96,6 @@
     });
     return [...new Set(out)].slice(0, 12);
   }
-
   function scrape(article) {
     const permalink = findPermalink(article);
     const id = fbIdOf(permalink) || permalink;
@@ -104,7 +104,6 @@
     const msg = article.querySelector('[data-ad-comet-preview="message"],[data-ad-preview="message"]');
     const body_text = richText(msg).trim();
 
-    // Reshare: a nested article is the original post.
     let is_share = 0, original_author = "", original_url = "", original_text = "";
     const nested = article.querySelector('[role="article"]');
     if (nested && nested !== article) {
@@ -116,38 +115,57 @@
       original_text = richText(omsg).trim();
     }
 
+    const t = postTime(article);
     seen.add(id);
     return {
-      fb_id: id,
-      source_url: permalink,
-      post_time: postTime(article),
-      body_text,
-      image_urls: images(article),
-      is_share,
-      original_author,
-      original_url,
-      original_text,
+      fb_id: id, source_url: permalink, post_time: t.ms, _exact: t.exact,
+      body_text, image_urls: images(article),
+      is_share, original_author, original_url, original_text,
     };
   }
 
-  // ── sweep loop ───────────────────────────────────────────────────────────
+  // ── scan loop: scrape → batch → import → detect the boundary ──────────────
+  async function start() {
+    scanning = true; buf = []; existedRun = 0; oldRun = 0; doneReason = "";
+    try { const c = await ext.runtime.sendMessage({ type: "cutoff" }); cutoffMs = (c && c.max_ts) || 0; }
+    catch (e) { cutoffMs = 0; }
+    paint();
+    sweep();
+  }
+  function stop(reason) { scanning = false; doneReason = reason || ""; void flush(); paint(); }
+
+  async function flush() {
+    if (!buf.length) return;
+    const batch = buf; buf = [];
+    let res;
+    try { res = await ext.runtime.sendMessage({ type: "importBatch", payload: batch }); }
+    catch (e) { failed += batch.length; paint(); return; }
+    const results = (res && res.ok && res.results) || [];
+    results.forEach((r, i) => {
+      if (r && r.ok) {
+        if (r.existed) existedRun++; else { existedRun = 0; imported++; }
+      } else failed++;
+      const p = batch[i];
+      if (p && p._exact && cutoffMs) { if (p.post_time < cutoffMs) oldRun++; else oldRun = 0; }
+    });
+    paint();
+    if (existedRun >= STOP_AFTER) stop("reached posts already in your archive — done");
+    else if (oldRun >= STOP_AFTER) stop("reached your export's date — older posts are already backed up");
+  }
+
   async function sweep() {
     if (!scanning) return;
-    const arts = document.querySelectorAll('[role="article"]');
-    for (const a of arts) {
-      // top-level posts only (skip the nested original inside a reshare)
-      if (a.parentElement && a.parentElement.closest('[role="article"]')) continue;
+    for (const a of document.querySelectorAll('[role="article"]')) {
+      if (a.parentElement && a.parentElement.closest('[role="article"]')) continue; // skip nested original
       let p;
       try { p = scrape(a); } catch (e) { p = null; }
       if (!p) continue;
       if (!p.body_text && !p.image_urls.length && !p.is_share) continue;
-      scanned++; paint();
-      try {
-        const res = await browser.runtime.sendMessage({ type: "import", payload: p });
-        if (res && res.ok) imported++; else failed++;
-      } catch (e) { failed++; }
-      paint();
+      scanned++; buf.push(p); paint();
+      if (buf.length >= BATCH) { await flush(); if (!scanning) return; }
     }
-    if (scanning) setTimeout(sweep, 1500);
+    await flush();
+    if (!scanning) return;
+    setTimeout(sweep, 1500);
   }
 })();

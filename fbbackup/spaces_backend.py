@@ -458,6 +458,28 @@ class SpacesBackend:
             return
         raise HTTPException(401, "write requires token")
 
+    def _export_max_ts(self) -> int:
+        """Max timestamp (ms) across the export's posts.jsonl, cached. 0 if none.
+        Live imports go to spaces-data (not posts.jsonl), so this stays the EXPORT
+        boundary — exactly what a first scan should stop at."""
+        cached = getattr(self, "_cutoff_ms_cache", None)
+        if cached is not None:
+            return cached
+        mx = 0
+        try:
+            with (self._index_dir / "posts.jsonl").open(encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        t = json.loads(line).get("timestamp", 0)
+                    except Exception:
+                        continue
+                    if t and t > mx:
+                        mx = t
+        except Exception:
+            pass
+        self._cutoff_ms_cache = mx * 1000  # seconds → ms (the scanner uses ms)
+        return self._cutoff_ms_cache
+
     def _thumb(self, abs_path: Path, w: int) -> Path | None:
         import hashlib
         if abs_path.suffix.lower() == ".gif":
@@ -831,14 +853,19 @@ class SpacesBackend:
         def unfurl(url: str):
             return b._unfurl(url)
 
-        @r.post("/import")
-        def fb_import(request: Request, payload: dict):
-            """Scan-mode import: one scraped post → a markdown row in spaces-data
-            (same format as the export), so live posts appear alongside the
-            export in the FB Browser. Images are downloaded for a permanent
-            backup; reshared videos/posts display via the original-URL FB embed.
-            """
-            b._require_write(request)
+        @r.get("/cutoff")
+        def cutoff():
+            """Newest EXPORT post timestamp (ms). The scanner stops scrolling
+            once it scrolls past this — i.e. into posts the export already has —
+            so a first scan only imports the gap between the export and now."""
+            return {"max_ts": b._export_max_ts()}
+
+        def _import_one(payload: dict) -> dict:
+            """One scraped post → a markdown row in spaces-data (same format as
+            the export), so live posts appear alongside the export in the FB
+            Browser. Images are downloaded for a permanent backup; reshared
+            videos/posts display via the original-URL FB embed. `existed` lets
+            the scanner stop once it scrolls into already-imported territory."""
             from .spaces_writer import post_to_row
             post, year, images = b._prep_live(payload)
             media_dir = b.root / "_live-media" / post["fb_id"]
@@ -852,8 +879,23 @@ class SpacesBackend:
             out_dir.mkdir(parents=True, exist_ok=True)
             existed = (out_dir / fn).exists()
             (out_dir / fn).write_text(content, encoding="utf-8")
-            b._index = None  # rebuilt lazily on the next browse — keeps it fresh
             return {"ok": True, "id": f"default/{year}/{fn[:-3]}",
-                    "images": len(post["media"]), "updated": existed}
+                    "images": len(post["media"]), "existed": existed, "updated": existed}
+
+        @r.post("/import")
+        async def fb_import(request: Request):
+            """Scan-mode import. Accepts a single post (legacy) OR a batch — a
+            JSON array or {"posts":[...]} — and returns per-post results so the
+            scanner can batch + detect the already-imported boundary."""
+            b._require_write(request)
+            body = await request.json()
+            batch = body if isinstance(body, list) else (
+                body.get("posts") if isinstance(body, dict) and isinstance(body.get("posts"), list) else None)
+            items = batch if batch is not None else [body]
+            results = [_import_one(p) for p in items]
+            b._index = None  # rebuilt lazily on the next browse — keeps it fresh
+            if batch is not None:
+                return {"ok": True, "count": len(results), "results": results}
+            return results[0]
 
         app.include_router(r, prefix=self.prefix)

@@ -1,10 +1,10 @@
 {
-  "manifest_version": 2,
+  "manifest_version": 3,
   "name": "fbbackup scanner",
   "version": "0.1.0",
-  "description": "Scan your Facebook posts into your local fbbackup archive as you scroll. No scheduling — scan mode imports each post live.",
-  "permissions": [
-    "storage",
+  "description": "Scan your Facebook posts into your local fbbackup archive as you scroll. Stops on its own at the posts you already have.",
+  "permissions": ["storage"],
+  "host_permissions": [
     "*://*.facebook.com/*",
     "http://localhost/*",
     "http://127.0.0.1/*",
@@ -19,8 +19,8 @@
       "all_frames": false
     }
   ],
-  "background": { "scripts": ["background.js"], "persistent": true },
-  "browser_action": {
+  "background": { "service_worker": "background.js" },
+  "action": {
     "default_popup": "popup.html",
     "default_title": "fbbackup scanner"
   }
