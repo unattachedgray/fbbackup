@@ -188,6 +188,11 @@ def embed(spaces_root: Path, out_dir: Path, workspace: str = "default") -> dict:
             ids.append(f"{workspace}/{ydir.name}/{p.stem}")
             texts.append(txt)
 
+    if not texts:
+        print("no embeddable rows found (all rows are trivial/empty) — skipping "
+              "embeddings; keyword search still works.", flush=True)
+        return {"provider": provider, "count": 0, "dim": 0}
+
     model = {"gemini": GEMINI_MODEL, "weft": "mistral-embed (apicascade)"}.get(provider, LOCAL_MODEL)
     print(f"embedding {len(texts)} rows via {provider} ({model}) …", flush=True)
     if provider == "gemini":
