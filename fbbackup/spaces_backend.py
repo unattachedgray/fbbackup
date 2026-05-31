@@ -134,7 +134,7 @@ class SpacesBackend:
         self._emb_provider = "gemini"  # overwritten from embed-meta.json on load
         # In-memory browse/search index (built once, lazily) — reading 5k+ .md
         # files per request was the slow path. None = not built yet.
-        self._index: dict | None = None
+        self._indexes: dict[str, dict] = {}  # per-workspace browse/search index
         # Serialize index builds. Without this, a burst of requests after a
         # cold start (the FB page fires /meta + /db + /search at once) each see
         # _index is None and rebuild all 7k+ files concurrently — 3x the
@@ -245,10 +245,10 @@ class SpacesBackend:
         return out
 
     # ── in-memory index: speed + search + grey-out empties ───────────────────
-    def _build_index(self) -> dict:
+    def _build_index(self, workspace: str = "default") -> dict:
         rows: list[dict] = []
         by_year: dict[str, list] = {}
-        base = self._ws_root("default")
+        base = self._ws_root(workspace)
         if base.is_dir():
             for ydir in sorted(base.iterdir()):
                 if not ydir.is_dir() or ydir.name.startswith("."):
@@ -273,14 +273,15 @@ class SpacesBackend:
                     trivial = (not text_content) or (text_content == " ".join(title.split()))
                     empty = trivial and not has_visual
                     row = {
-                        "id": self._page_id("default", p), "title": title, "summary": summary,
+                        "id": self._page_id(workspace, p), "title": title, "summary": summary,
                         "props": props, "year": yr, "empty": empty,
                         "_blob": (title + " " + body + " " + tagstr).lower(),
                     }
                     rows.append(row)
                     by_year.setdefault(yr, []).append(row)
-        self._index = {"rows": rows, "by_year": by_year, "by_id": {r["id"]: r for r in rows}}
-        return self._index
+        idx = {"rows": rows, "by_year": by_year, "by_id": {r["id"]: r for r in rows}}
+        self._indexes[workspace] = idx
+        return idx
 
     # ── semantic search (local embeddings) ───────────────────────────────────
     def _load_embeddings(self) -> None:
@@ -311,7 +312,7 @@ class SpacesBackend:
         except Exception:
             return None
 
-    def _semantic(self, q: str, k: int = 40, exclude: set | None = None) -> list[dict]:
+    def _semantic(self, q: str, workspace: str = "default", k: int = 40, exclude: set | None = None) -> list[dict]:
         self._load_embeddings()
         if self._emb is None or not self._emb_ids:
             return []
@@ -321,7 +322,10 @@ class SpacesBackend:
             return []
         sims = self._emb @ qv
         order = np.argsort(-sims)
-        byid = self._ensure_index()["by_id"]
+        # Map embedding ids → rows of THIS workspace; ids from another workspace's
+        # embeddings simply won't be found (graceful empty until per-workspace
+        # embeddings land). Default (FB) keeps its existing behavior.
+        byid = self._ensure_index(workspace)["by_id"]
         out, ex = [], (exclude or set())
         for i in order[: k * 3]:
             if sims[i] < self._emb_threshold:
@@ -347,11 +351,11 @@ class SpacesBackend:
             pass
         return row.get("summary", "")
 
-    def _ask(self, question: str, k: int = 8) -> dict:
-        hits = self._semantic(question, k=k)
+    def _ask(self, question: str, workspace: str = "default", k: int = 8) -> dict:
+        hits = self._semantic(question, workspace, k=k)
         if not hits:  # fall back to keyword
             toks = [t for t in question.lower().split() if t]
-            hits = [r for r in self._ensure_index()["rows"] if toks and all(t in r["_blob"] for t in toks)][:k]
+            hits = [r for r in self._ensure_index(workspace)["rows"] if toks and all(t in r["_blob"] for t in toks)][:k]
         ctx = []
         for r in hits[:k]:
             body = " ".join(self._row_text(r).split())[:450]
@@ -380,17 +384,17 @@ class SpacesBackend:
         except Exception as e:
             return f"(LLM error: {str(e)[:140]})"
 
-    def _ensure_index(self) -> dict:
+    def _ensure_index(self, workspace: str = "default") -> dict:
         # Double-checked locking: the common case (index already built) takes no
         # lock; only the cold/invalidated path serializes through _index_lock so
         # concurrent callers don't stampede a rebuild over 7k+ files.
-        idx = self._index
+        idx = self._indexes.get(workspace)
         if idx is not None:
             return idx
         with self._index_lock:
-            if self._index is None:
-                self._build_index()
-            return self._index  # type: ignore[return-value]
+            if workspace not in self._indexes:
+                self._build_index(workspace)
+            return self._indexes[workspace]
 
     @staticmethod
     def _public(row: dict) -> dict:
@@ -409,8 +413,8 @@ class SpacesBackend:
         return schema
 
     def _read_db(self, workspace: str, name: str) -> dict:
-        idx = self._ensure_index()
-        rows_full = idx["by_year"].get(name, []) if workspace == "default" else []
+        idx = self._ensure_index(workspace)
+        rows_full = idx["by_year"].get(name, [])
         return {"name": name, "workspace": workspace,
                 "schema": self._schema_of(rows_full),
                 "rows": [self._public(r) for r in rows_full]}
@@ -737,7 +741,7 @@ class SpacesBackend:
         def db_list(workspace: str = "default"):
             if not _NAME_OK.match(workspace):
                 raise HTTPException(400, "invalid workspace")
-            idx = b._ensure_index()
+            idx = b._ensure_index(workspace)
             out = [{"name": yr, "rows": len(rows)} for yr, rows in sorted(idx["by_year"].items())]
             return {"workspace": workspace, "databases": out}
 
@@ -746,8 +750,8 @@ class SpacesBackend:
             return b._read_db(workspace, name)
 
         @r.get("/meta")
-        def meta():
-            idx = b._ensure_index()
+        def meta(workspace: str = "default"):
+            idx = b._ensure_index(workspace)
             types: dict[str, int] = {}
             for row in idx["rows"]:
                 t = str(row["props"].get("type", ""))
@@ -757,30 +761,30 @@ class SpacesBackend:
                     "profile_url": b.profile_url}
 
         @r.get("/search")
-        def search(q: str, limit: int = 300, semantic: bool = True):
-            idx = b._ensure_index()
+        def search(q: str, limit: int = 300, semantic: bool = True, workspace: str = "default"):
+            idx = b._ensure_index(workspace)
             toks = [t for t in q.lower().split() if t]
             kw = [r for r in idx["rows"] if all(t in r["_blob"] for t in toks)] if toks else []
             kw.sort(key=lambda r: str(r["props"].get("date", "")), reverse=True)
             kw_ids = {r["id"] for r in kw}
             related = []
             if semantic and q.strip():
-                related = [b._public(r) for r in b._semantic(q, k=40, exclude=kw_ids)]
+                related = [b._public(r) for r in b._semantic(q, workspace, k=40, exclude=kw_ids)]
             return {"q": q, "total": len(kw), "rows": [b._public(r) for r in kw[:limit]],
                     "related": related}
 
         @r.post("/ask")
-        def ask(payload: dict):
+        def ask(payload: dict, workspace: str = "default"):
             q = (payload.get("question") or "").strip()
             if not q:
                 raise HTTPException(400, "question required")
-            return b._ask(q)
+            return b._ask(q, workspace)
 
         @r.post("/reindex")
-        def reindex(request: Request):
+        def reindex(request: Request, workspace: str = "default"):
             b._require_write(request)
-            b._build_index()
-            return {"ok": True, "rows": len(b._index["rows"])}
+            b._build_index(workspace)
+            return {"ok": True, "rows": len(b._indexes[workspace]["rows"])}
 
         @r.post("/db/{name}/set")
         def db_set(name: str, request: Request, payload: dict = Body(...)):
@@ -790,7 +794,7 @@ class SpacesBackend:
             if not oid or not key:
                 raise HTTPException(400, "id and key required")
             b._set_prop(oid, key, payload.get("value"))
-            b._index = None  # reflect the edit on next browse/search
+            b._indexes.clear()  # reflect the edit on next browse/search (any workspace)
             return {"ok": True}
 
         @r.post("/db/{name}/new")
