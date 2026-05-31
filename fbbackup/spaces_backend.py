@@ -130,8 +130,8 @@ class SpacesBackend:
         # Mistral key for embedding the search/chat QUERY (same provider as the
         # offline `fbbackup embed` step). Empty = semantic search disabled.
         self.embed_key = embed_key
-        self._emb_threshold = 0.62
-        self._emb_provider = "gemini"  # overwritten from embed-meta.json on load
+        # Per-workspace embeddings cache: workspace → {emb, ids, threshold, provider}.
+        self._emb_cache: dict[str, dict] = {}
         # In-memory browse/search index (built once, lazily) — reading 5k+ .md
         # files per request was the slow path. None = not built yet.
         self._indexes: dict[str, dict] = {}  # per-workspace browse/search index
@@ -145,10 +145,7 @@ class SpacesBackend:
         # Semantic search: local embeddings (index/embeddings.npy) + the query
         # model, both loaded lazily. None = not loaded / unavailable.
         self._index_dir = self.root.parent / "index"
-        self._emb = None          # numpy float32 [N, dim]
-        self._emb_ids: list | None = None
-        self._emb_model = None    # fastembed model for embedding the query
-        self._emb_loaded = False
+        self._emb_model = None    # fastembed model for embedding the query (shared)
 
     # ── path / id helpers (weftbase.py) ──────────────────────────────────────
     def _ws_root(self, workspace: str) -> Path:
@@ -283,54 +280,56 @@ class SpacesBackend:
         self._indexes[workspace] = idx
         return idx
 
-    # ── semantic search (local embeddings) ───────────────────────────────────
-    def _load_embeddings(self) -> None:
-        if self._emb_loaded:
+    # ── semantic search (per-workspace local embeddings) ─────────────────────
+    def _emb_dir(self, workspace: str) -> Path:
+        # FB (default) embeddings live in index/ (legacy); others in index/<ws>/.
+        return self._index_dir if workspace == "default" else (self._index_dir / workspace)
+
+    def _load_embeddings(self, workspace: str = "default") -> None:
+        if workspace in self._emb_cache:
             return
-        self._emb_loaded = True
+        ent: dict = {"emb": None, "ids": None, "threshold": 0.62, "provider": "gemini"}
         try:
             import numpy as np
-            arr = self._index_dir / "embeddings.npy"
-            ids = self._index_dir / "embed-ids.json"
-            meta = self._index_dir / "embed-meta.json"
+            d = self._emb_dir(workspace)
+            arr, ids, meta = d / "embeddings.npy", d / "embed-ids.json", d / "embed-meta.json"
             if arr.is_file() and ids.is_file():
-                self._emb = np.load(arr)
-                self._emb_ids = json.loads(ids.read_text(encoding="utf-8"))
+                ent["emb"] = np.load(arr)
+                ent["ids"] = json.loads(ids.read_text(encoding="utf-8"))
                 if meta.is_file():
                     m = json.loads(meta.read_text(encoding="utf-8"))
-                    self._emb_threshold = float(m.get("threshold", 0.62))
-                    self._emb_provider = m.get("provider", "gemini")
+                    ent["threshold"] = float(m.get("threshold", 0.62))
+                    ent["provider"] = m.get("provider", "gemini")
         except Exception:
-            self._emb = None
+            ent["emb"] = None
+        self._emb_cache[workspace] = ent
 
-    def _embed_query(self, q: str):
+    def _embed_query(self, q: str, provider: str):
         try:
             import numpy as np
             from .embed import embed_query
-            v = np.asarray(embed_query(q, self._emb_provider, self.embed_key), dtype="float32")
+            v = np.asarray(embed_query(q, provider, self.embed_key), dtype="float32")
             return v / (np.linalg.norm(v) + 1e-9)
         except Exception:
             return None
 
     def _semantic(self, q: str, workspace: str = "default", k: int = 40, exclude: set | None = None) -> list[dict]:
-        self._load_embeddings()
-        if self._emb is None or not self._emb_ids:
+        self._load_embeddings(workspace)
+        ent = self._emb_cache[workspace]
+        if ent["emb"] is None or not ent["ids"]:
             return []
         import numpy as np
-        qv = self._embed_query(q)
+        qv = self._embed_query(q, ent["provider"])
         if qv is None:
             return []
-        sims = self._emb @ qv
+        sims = ent["emb"] @ qv
         order = np.argsort(-sims)
-        # Map embedding ids → rows of THIS workspace; ids from another workspace's
-        # embeddings simply won't be found (graceful empty until per-workspace
-        # embeddings land). Default (FB) keeps its existing behavior.
         byid = self._ensure_index(workspace)["by_id"]
         out, ex = [], (exclude or set())
         for i in order[: k * 3]:
-            if sims[i] < self._emb_threshold:
+            if sims[i] < ent["threshold"]:
                 break
-            rid = self._emb_ids[i]
+            rid = ent["ids"][i]
             if rid in ex:
                 continue
             row = byid.get(rid)
@@ -519,8 +518,8 @@ class SpacesBackend:
             try:
                 from .embed import embed
                 embed(self.root, self._index_dir)
-                self._emb_loaded = False          # force reload of the new vectors
-                self._load_embeddings()
+                self._emb_cache.pop("default", None)  # force reload of the new vectors
+                self._load_embeddings("default")
                 self._reembed_state = {"running": False, "done": True, "error": None}
             except Exception as e:  # noqa: BLE001
                 self._reembed_state = {"running": False, "done": False, "error": str(e)}
