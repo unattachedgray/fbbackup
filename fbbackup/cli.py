@@ -6,6 +6,8 @@
     fbbackup index     parse + build + embed  (the whole pipeline, one command)
     fbbackup serve     run the standalone timeline viewer
     fbbackup share     expose the running dashboard via a Cloudflare quick tunnel
+    fbbackup export-static  index → a self-contained static site (browse + keyword)
+    fbbackup publish   deploy a static export to a free host (GitHub/Cloudflare/…)
     fbbackup status     what's present (export? index? rows? embeddings?)
 
 Paths resolve in this order: CLI flag > FBBACKUP_* env > config.toml > default.
@@ -140,6 +142,48 @@ def cmd_share(args) -> int:
     return subprocess.call(["cloudflared", "tunnel", "--url", url])
 
 
+def cmd_export_static(args) -> int:
+    """index/posts.jsonl → a self-contained static site (browse + keyword search,
+    no backend) you can publish anywhere. The LOCAL app keeps the full experience."""
+    from fbbackup.export_static import export_static
+    p = _paths(args)
+    out = _abs(args.out or "static-site")
+    res = export_static(p["index"], out, media_mode=args.media)
+    print(f"✓ static site → {res['out']}", flush=True)
+    print(f"  {res['posts']} posts · {res['media_copied']} media · "
+          f"{res['files']} files · {res['size_mb']} MB", flush=True)
+    if args.media == "copy" and res["size_mb"] > 900:
+        print("  ⚠ >900 MB — over GitHub Pages' 1 GB cap. Use --media omit, or "
+              "publish to Cloudflare Pages/Netlify.", flush=True)
+    print(f"  preview: cd {res['out']} && python3 -m http.server 8000", flush=True)
+    print(f"  publish: fbbackup publish --target github-pages --dir {res['out']}", flush=True)
+    return 0
+
+
+def cmd_publish(args) -> int:
+    from fbbackup.export_static import publish, PUBLISH_TARGETS, recommend_sharing
+    if args.target == "list" or not args.target:
+        print("publish targets (static archive — keyword search, no backend):\n")
+        for k, t in sorted(PUBLISH_TARGETS.items(), key=lambda kv: kv[1]["easiest"]):
+            print(f"  {k:18} {t['label']:18} {t['limits']}")
+            print(f"  {'':18} ↳ {t['best_for']}  · sign up: {t['signup']}")
+        print("\nrun: fbbackup publish --target <name> --dir <static-site> [--open-signup]")
+        return 0
+    if args.target == "recommend":
+        p = _paths(args)
+        posts = p["index"] / "posts.jsonl"
+        n = sum(1 for _ in posts.open(encoding="utf-8")) if posts.is_file() else 0
+        media = sum(line.count('"abs_path"') for line in posts.open(encoding="utf-8")) if posts.is_file() else 0
+        rec = recommend_sharing(n, media * 0.4, media)  # ~0.4 MB/photo estimate
+        print(f"▸ {rec['headline']}\n  {rec['why']}")
+        if rec.get("share"):
+            print(f"  {rec['share']}")
+        if rec.get("publish"):
+            print(f"  best host: {rec['publish']['target']} — {rec['publish']['why']}")
+        return 0
+    return publish(args.target, _abs(args.dir or "static-site"), open_signup=args.open_signup)
+
+
 def cmd_status(args) -> int:
     p = _paths(args)
     posts = p["index"] / "posts.jsonl"
@@ -185,6 +229,18 @@ def _build_parser() -> argparse.ArgumentParser:
     sh = sub.add_parser("share", help="Cloudflare quick tunnel to a running server")
     sh.add_argument("--port", default="9119", help="local port to expose (default 9119)")
 
+    ex = sub.add_parser("export-static", help="index → self-contained static site")
+    common(ex, index=True)
+    ex.add_argument("--out", help="output dir (default: static-site)")
+    ex.add_argument("--media", choices=["copy", "omit", "link"], default="copy",
+                    help="copy media into the site (default), omit it, or link to FB")
+
+    pb = sub.add_parser("publish", help="deploy a static export to a free host")
+    pb.add_argument("--target", help="github-pages | cloudflare-pages | netlify | surge | vercel | list | recommend")
+    pb.add_argument("--dir", help="static-site dir to publish (default: static-site)")
+    pb.add_argument("--open-signup", action="store_true", help="open the host's sign-up page in a browser")
+    common(pb, index=True)
+
     common(sub.add_parser("status", help="show what's present"), export=True, index=True, spaces=True)
     return ap
 
@@ -192,6 +248,7 @@ def _build_parser() -> argparse.ArgumentParser:
 _DISPATCH = {
     "parse": cmd_parse, "build": cmd_build, "embed": cmd_embed, "index": cmd_index,
     "serve": cmd_serve, "share": cmd_share, "status": cmd_status,
+    "export-static": cmd_export_static, "publish": cmd_publish,
 }
 
 
