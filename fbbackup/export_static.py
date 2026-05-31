@@ -86,20 +86,42 @@ PUBLISH_TARGETS: dict[str, dict] = {
 # ── live-tunnel options: machine STAYS ON but keeps the FULL app (semantic
 # search + chat + media). The wizard frames these vs a static publish. ────────
 TUNNELS: dict[str, dict] = {
+    # PRIVATE: reach YOUR OWN archive from your other devices over your tailnet —
+    # no public link, gated by your dashboard login. The "keep it local but
+    # remote-to-me" option for people who don't want to publish at all.
+    "tailscale_serve": {
+        "label": "Tailscale (private — your devices only)", "easiest": 1,
+        "account": True, "public": False,
+        "signup": "https://login.tailscale.com/start",
+        "best_for": "reach your archive from your phone/laptop privately — no public link",
+        "tradeoff": "free Tailscale account + `tailscale up` on each device (browser login)",
+        "cmd": "tailscale serve {port}",
+    },
     "cloudflared": {
-        "label": "Cloudflare quick tunnel", "easiest": 1, "account": False,
+        "label": "Cloudflare quick tunnel", "easiest": 1, "account": False, "public": True,
         "best_for": "show someone RIGHT NOW; zero setup, no account",
         "tradeoff": "random URL that changes each run; machine must stay on",
         "cmd": "cloudflared tunnel --url http://localhost:{port}",
     },
     "tailscale": {
-        "label": "Tailscale Funnel", "easiest": 2, "account": True,
+        "label": "Tailscale Funnel (public)", "easiest": 2, "account": True, "public": True,
         "signup": "https://login.tailscale.com/start",
         "best_for": "a STABLE public HTTPS URL you reuse; still full features",
         "tradeoff": "needs a free Tailscale account + `tailscale up` (browser login)",
         "cmd": "tailscale funnel {port}",
     },
 }
+
+
+# Every publish host + Tailscale supports "Continue with Google". STRONGLY
+# recommend the user be signed into Google in the browser FIRST — then every
+# signup is one click, no new account/password. Surfaced wherever a signup
+# appears (the wizard shows it before the host steps).
+GOOGLE_AUTH_TIP = (
+    "Strongly recommended: sign into your Google account in this browser FIRST. "
+    "Then each host's 'Continue with Google' makes signup one click — no new "
+    "account or password to remember."
+)
 
 
 def recommend_sharing(posts: int, size_mb: float, media: int) -> dict:
@@ -121,7 +143,11 @@ def recommend_sharing(posts: int, size_mb: float, media: int) -> dict:
             "share": "If you want to show it to someone, open a live tunnel "
                      "(Cloudflare quick tunnel = zero setup; Tailscale Funnel = "
                      "stable URL) — the machine stays on but keeps every feature.",
+            "private": "To reach it from your OWN phone/laptop without any public "
+                       "link, use a private Tailscale tunnel (`tailscale serve`) — "
+                       "tailnet-only, gated by your dashboard login.",
             "tunnels": list(TUNNELS),
+            "google_tip": GOOGLE_AUTH_TIP,
         }
     if posts >= 1500:
         host = recommend_host(size_mb, media)
@@ -131,7 +157,10 @@ def recommend_sharing(posts: int, size_mb: float, media: int) -> dict:
             "why": (f"{posts:,} posts is mid-sized. Locally you keep semantic search "
                     "+ chat; a static publish gives a permanent, machine-off public "
                     "link with browse + keyword search."),
+            "private": "Prefer private? Reach the local server from your own devices "
+                       "via Tailscale (`tailscale serve`) — no public link.",
             "publish": host, "tunnels": list(TUNNELS),
+            "google_tip": GOOGLE_AUTH_TIP,
         }
     host = recommend_host(size_mb, media)
     return {
@@ -140,6 +169,7 @@ def recommend_sharing(posts: int, size_mb: float, media: int) -> dict:
         "why": (f"{posts:,} posts / {size_mb:.0f} MB is small enough to publish as a "
                 "static site to almost any free host — permanent link, machine off."),
         "publish": host,
+        "google_tip": GOOGLE_AUTH_TIP,
     }
 
 
