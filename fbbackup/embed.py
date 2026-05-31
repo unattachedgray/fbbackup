@@ -121,7 +121,13 @@ def _local_model():
     global _LOCAL
     if _LOCAL is None:
         from fastembed import TextEmbedding
-        _LOCAL = TextEmbedding(LOCAL_MODEL)
+        # GPU is opt-in (needs the `fbbackup[gpu]` extra → onnxruntime-gpu). The
+        # setup wizard sets FBBACKUP_EMBED_DEVICE=gpu when it detects a GPU;
+        # CUDA→CPU fallback is automatic if the GPU provider isn't available.
+        if os.environ.get("FBBACKUP_EMBED_DEVICE", "").lower() == "gpu":
+            _LOCAL = TextEmbedding(LOCAL_MODEL, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+        else:
+            _LOCAL = TextEmbedding(LOCAL_MODEL)
     return _LOCAL
 
 
@@ -129,6 +135,61 @@ def _local_embed(texts: list[str], is_query: bool) -> list[list[float]]:
     # jina-v3 / e5 / arctic are asymmetric; the query/passage prefixes matter.
     pfx = "query: " if is_query else "passage: "
     return [list(map(float, v)) for v in _local_model().embed([pfx + t for t in texts])]
+
+
+# ── batched embedding + resumable checkpoint ─────────────────────────────────
+# A whole-archive embed on a paced free key can take a long time; persist
+# progress per batch so an interruption (browser close, 429 storm, power loss)
+# resumes instead of re-embedding everything. The checkpoint is keyed to a
+# fingerprint of (provider, model, row ids) so a changed corpus invalidates it.
+def _embed_batch(provider: str, texts: list[str], key: str) -> list[list[float]]:
+    if provider == "gemini":
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            return list(ex.map(lambda t: _gemini_one(t, key, "RETRIEVAL_DOCUMENT"), texts))
+    if provider == "weft":
+        return _weft_embed(texts, key)
+    return _local_embed(texts, False)
+
+
+def _fingerprint(provider: str, model: str, ids: list[str]) -> str:
+    import hashlib
+    h = hashlib.sha256(f"{provider}\0{model}\0{len(ids)}".encode())
+    for i in ids:
+        h.update(b"\0")
+        h.update(i.encode())
+    return h.hexdigest()[:16]
+
+
+def _ckpt_paths(out_dir: Path) -> tuple[Path, Path]:
+    return out_dir / "embed-ckpt.npy", out_dir / "embed-ckpt.json"
+
+
+def _load_ckpt(out_dir: Path, fp: str) -> list[list[float]]:
+    import numpy as np
+    npy, js = _ckpt_paths(out_dir)
+    try:
+        meta = json.loads(js.read_text(encoding="utf-8"))
+        if meta.get("fingerprint") == fp and npy.exists():
+            return [list(map(float, v)) for v in np.load(npy)]
+    except Exception:  # corrupt/mismatched checkpoint → start clean
+        pass
+    return []
+
+
+def _save_ckpt(out_dir: Path, fp: str, vecs: list[list[float]], provider: str, model: str) -> None:
+    import numpy as np
+    npy, js = _ckpt_paths(out_dir)
+    np.save(npy, np.asarray(vecs, dtype="float32"))
+    js.write_text(json.dumps({"fingerprint": fp, "done": len(vecs),
+                              "provider": provider, "model": model}), encoding="utf-8")
+
+
+def _clear_ckpt(out_dir: Path) -> None:
+    for p in _ckpt_paths(out_dir):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
 
 
 # ── unified API (used by the backend for the query, and embed() for the bulk) ─
@@ -205,27 +266,19 @@ def embed(spaces_root: Path, out_dir: Path, workspace: str = "default") -> dict:
         return {"provider": provider, "count": 0, "dim": 0}
 
     model = {"gemini": GEMINI_MODEL, "weft": "mistral-embed (apicascade)"}.get(provider, LOCAL_MODEL)
-    print(f"embedding {len(texts)} rows via {provider} ({model}) …", flush=True)
-    if provider == "gemini":
-        done = [0]
-        def one(t):
-            v = _gemini_one(t, key, "RETRIEVAL_DOCUMENT")
-            done[0] += 1
-            if done[0] % 1000 == 0:
-                print(f"  …{done[0]}/{len(texts)}", flush=True)
-            return v
-        with ThreadPoolExecutor(max_workers=16) as ex:
-            vecs = list(ex.map(one, texts))
-    elif provider == "weft":
-        vecs = []
-        for i in range(0, len(texts), 128):
-            vecs.extend(_weft_embed(texts[i:i + 128], key))
-            print(f"  …{min(i + 128, len(texts))}/{len(texts)}", flush=True)
+    # Batch sizes per provider (remote = fewer requests under a rate limit).
+    batch = {"gemini": 256, "weft": 128}.get(provider, 256)
+    fp = _fingerprint(provider, model, ids)
+    vecs = _load_ckpt(out_dir, fp)  # resume a prior run for THIS exact corpus
+    start = len(vecs)
+    if start:
+        print(f"resuming embed at {start}/{len(texts)} via {provider} (checkpoint) …", flush=True)
     else:
-        vecs = []
-        for i in range(0, len(texts), 256):
-            vecs.extend(_local_embed(texts[i:i + 256], False))
-            print(f"  …{min(i + 256, len(texts))}/{len(texts)}", flush=True)
+        print(f"embedding {len(texts)} rows via {provider} ({model}) …", flush=True)
+    for i in range(start, len(texts), batch):
+        vecs.extend(_embed_batch(provider, texts[i:i + batch], key))
+        _save_ckpt(out_dir, fp, vecs, provider, model)  # checkpoint each batch
+        print(f"  …{min(i + batch, len(texts))}/{len(texts)}", flush=True)
 
     arr = np.asarray(vecs, dtype="float32")
     arr /= (np.linalg.norm(arr, axis=1, keepdims=True) + 1e-9)
@@ -234,6 +287,7 @@ def embed(spaces_root: Path, out_dir: Path, workspace: str = "default") -> dict:
     (out_dir / "embed-meta.json").write_text(json.dumps(
         {"provider": provider, "model": model, "dim": int(arr.shape[1]),
          "count": len(ids), "threshold": THRESHOLDS.get(provider, 0.5)}), encoding="utf-8")
+    _clear_ckpt(out_dir)  # done → drop the resume checkpoint
     print(f"saved {arr.shape} ({provider}) -> {out_dir / 'embeddings.npy'}", flush=True)
     return {"provider": provider, "count": len(ids), "dim": int(arr.shape[1])}
 

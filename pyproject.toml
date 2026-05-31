@@ -7,7 +7,16 @@ dependencies = [
     "fastapi>=0.110",
     "uvicorn>=0.29",
     "pyyaml>=6.0",
+    "numpy>=1.24",  # embed() normalizes/saves vectors unconditionally
 ]
+
+[project.optional-dependencies]
+# Local, no-key embeddings on CPU (fastembed/ONNX). Remote providers
+# (gemini / apicascade) need neither — they're pure HTTP.
+local = ["fastembed>=0.3"]
+# GPU acceleration for the local model. ~277 MB — opt in only with a CUDA GPU
+# (FBBACKUP_EMBED_DEVICE=gpu); the setup wizard sets it when it detects one.
+gpu = ["fastembed>=0.3", "onnxruntime-gpu>=1.17"]
 
 [project.scripts]
 fbbackup = "fbbackup.cli:main"
