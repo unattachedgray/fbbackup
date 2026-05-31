@@ -37,7 +37,7 @@ LOCAL_MODEL = os.environ.get("FBBACKUP_EMBED_MODEL", "jinaai/jina-embeddings-v3"
 # Per-provider score floor for "related" search (chat retrieval uses top-k rank).
 # weft = apicascade /v1/embeddings (mistral-embed, 1024-d) — tighter separation
 # than gemini/jina, so a higher floor.
-THRESHOLDS = {"gemini": 0.62, "weft": 0.78, "local": 0.45}
+THRESHOLDS = {"gemini": 0.62, "weft": 0.78, "local": 0.30}  # jina-v3 similarities run tight
 
 
 def gemini_key() -> str:
@@ -133,8 +133,11 @@ def _local_model():
 
 def _local_embed(texts: list[str], is_query: bool) -> list[list[float]]:
     # jina-v3 / e5 / arctic are asymmetric; the query/passage prefixes matter.
+    # Small batch by default: jina-v3's attention is memory-heavy — batch 256 OOMs
+    # even a 24GB GPU. FBBACKUP_EMBED_BATCH tunes it (raise for lighter models).
     pfx = "query: " if is_query else "passage: "
-    return [list(map(float, v)) for v in _local_model().embed([pfx + t for t in texts])]
+    bs = int(os.environ.get("FBBACKUP_EMBED_BATCH", "16"))
+    return [list(map(float, v)) for v in _local_model().embed([pfx + t for t in texts], batch_size=bs)]
 
 
 # ── batched embedding + resumable checkpoint ─────────────────────────────────
